@@ -17,6 +17,7 @@ ORDEM DE EXECUÇÃO:
 """
 
 from mmengine.hooks import Hook
+from mmengine.logging import MMLogger
 from mmdet.registry import HOOKS
 import torch
 import torch.nn.functional as F
@@ -226,7 +227,7 @@ def spatial_aware_relabeling(boxes, pred_labels, pred_scores, difficulty_thresho
 class VCNCKMeansConfusionAwareHook(Hook):
     """
     VCNC K-means + Confusion Gate
-    
+
     Fluxo:
     0. (NEW) Constrói lista negra de pares ruidosos via matriz de confusão
     1. Relabel por confiança alta — gate ativo
@@ -234,7 +235,14 @@ class VCNCKMeansConfusionAwareHook(Hook):
     3. Spatial Refinement (corrige contaminação espacial)
     4. Filtragem GMM (baseline)
     """
-    
+
+    @property
+    def _logger(self):
+        """Lazy-resolved MMLogger (the current instance is set up by the
+        runner before any hook fires, so this is safe to call from any
+        ``Hook`` entry point)."""
+        return MMLogger.get_current_instance()
+
     def __init__(self,
                  # Configuração geral
                  warmup_epochs: int = 1,
@@ -408,7 +416,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
                 
             except Exception as e:
                 if self.debug:
-                    print(f"[VCNC-Spatial] Erro GMM classe {cls_id}: {e}")
+                    self._logger.info(f"[VCNC-Spatial] Erro GMM classe {cls_id}: {e}")
         
         return gmm_dict
     
@@ -550,11 +558,11 @@ class VCNCKMeansConfusionAwareHook(Hook):
         
         if epoch <= self.warmup_epochs:
             if self.debug:
-                print(f"[VCNC-Spatial] Época {epoch}: Warmup, pulando.")
+                self._logger.info(f"[VCNC-Spatial] Época {epoch}: Warmup, pulando.")
             return
         
         if self.debug:
-            print(f"\n[VCNC-Spatial] ========== Época {epoch} ==========")
+            self._logger.info(f"\n[VCNC-Spatial] ========== Época {epoch} ==========")
 
         # Obter dataset
         dataloader = runner.train_loop.dataloader
@@ -568,7 +576,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
 
         
         # if not hasattr(dataset, 'datasets'):
-        #     print("[VCNC-Spatial] ERRO: Esperado ConcatDataset")
+        #     self._logger.info("[VCNC-Spatial] ERRO: Esperado ConcatDataset")
         #     return
         
         # datasets = dataset.datasets
@@ -586,7 +594,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
         # COLETA DE DADOS
         # ============================================================
         if self.debug:
-            print("[VCNC-Spatial] Coletando dados...")
+            self._logger.info("[VCNC-Spatial] Coletando dados...")
         
         all_box_data = []
         scores_by_class = defaultdict(list)
@@ -676,11 +684,11 @@ class VCNCKMeansConfusionAwareHook(Hook):
                     boxes_by_image[img_path].append(box_data)
         
         if len(all_box_data) == 0:
-            print("[VCNC-Spatial] Nenhum box coletado!")
+            self._logger.info("[VCNC-Spatial] Nenhum box coletado!")
             return
         
         if self.debug:
-            print(f"[VCNC-Spatial] Coletados {len(all_box_data)} boxes em {len(boxes_by_image)} imagens")
+            self._logger.info(f"[VCNC-Spatial] Coletados {len(all_box_data)} boxes em {len(boxes_by_image)} imagens")
         
         # ============================================================
         # ETAPA 0 (NEW): GATE DE CONFUSÃO — constrói lista negra de pares
@@ -691,23 +699,23 @@ class VCNCKMeansConfusionAwareHook(Hook):
         if gate_active:
             confused_pairs, confusion_stats = self._compute_confusion_signals(all_box_data)
             if self.debug:
-                print(f"\n[VCNC-Spatial] === GATE DE CONFUSÃO ===")
-                print(f"[VCNC-Spatial] Pares válidos analisados: {confusion_stats['n_valid_pairs']}")
-                print(f"[VCNC-Spatial] Pares marcados como ruidosos: {confusion_stats['n_confused_pairs']}")
-                print(f"[VCNC-Spatial] Severidade — mediana: {confusion_stats['median']:.4f}, "
+                self._logger.info(f"\n[VCNC-Spatial] === GATE DE CONFUSÃO ===")
+                self._logger.info(f"[VCNC-Spatial] Pares válidos analisados: {confusion_stats['n_valid_pairs']}")
+                self._logger.info(f"[VCNC-Spatial] Pares marcados como ruidosos: {confusion_stats['n_confused_pairs']}")
+                self._logger.info(f"[VCNC-Spatial] Severidade — mediana: {confusion_stats['median']:.4f}, "
                       f"MAD: {confusion_stats['mad']:.4f}")
-                print(f"[VCNC-Spatial] Threshold = max(med+{self.confusion_gate_mad_factor}*MAD, "
+                self._logger.info(f"[VCNC-Spatial] Threshold = max(med+{self.confusion_gate_mad_factor}*MAD, "
                       f"{self.confusion_gate_ratio_factor}*med) = "
                       f"{confusion_stats['threshold']:.4f}")
-                print(f"[VCNC-Spatial] Top 10 pares por severidade:")
+                self._logger.info(f"[VCNC-Spatial] Top 10 pares por severidade:")
                 for tp in confusion_stats['top_pairs']:
                     flag = "  ★ RUIDOSO" if tp['is_confused'] else ""
                     i, j = tp['pair']
-                    print(f"[VCNC-Spatial]   classes ({i}, {j}): sev={tp['severity']:.4f} "
+                    self._logger.info(f"[VCNC-Spatial]   classes ({i}, {j}): sev={tp['severity']:.4f} "
                           f"C[{i}->{j}]={tp['C_ij']:.4f}  C[{j}->{i}]={tp['C_ji']:.4f}{flag}")
         else:
             if self.debug:
-                print(f"[VCNC-Spatial] Gate de confusão DESATIVADO nesta época.")
+                self._logger.info(f"[VCNC-Spatial] Gate de confusão DESATIVADO nesta época.")
         
         gate_skip_count = {'confidence': 0, 'clustering': 0}
         gate_filter_count = {'confidence': 0, 'clustering': 0}
@@ -719,7 +727,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
         
         if self.enable_confidence_relabel:
             if self.debug:
-                print(f"\n[VCNC-Spatial] ETAPA 1: Relabel por confiança > {self.relabel_confidence_threshold}")
+                self._logger.info(f"\n[VCNC-Spatial] ETAPA 1: Relabel por confiança > {self.relabel_confidence_threshold}")
             
             for box in all_box_data:
                 if (box['pred_score'] > self.relabel_confidence_threshold and 
@@ -756,10 +764,10 @@ class VCNCKMeansConfusionAwareHook(Hook):
                     confidence_relabel_count += 1
             
             if self.debug:
-                print(f"[VCNC-Spatial] Relabelados por confiança: {confidence_relabel_count} "
+                self._logger.info(f"[VCNC-Spatial] Relabelados por confiança: {confidence_relabel_count} "
                       f"({confidence_relabel_count/len(all_box_data)*100:.2f}%)")
                 if gate_active:
-                    print(f"[VCNC-Spatial] Gate Etapa 1 — skip: {gate_skip_count['confidence']}, "
+                    self._logger.info(f"[VCNC-Spatial] Gate Etapa 1 — skip: {gate_skip_count['confidence']}, "
                           f"filter: {gate_filter_count['confidence']}")
         
         # ============================================================
@@ -769,7 +777,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
         
         if self.enable_clustering_relabel:
             if self.debug:
-                print(f"\n[VCNC-Spatial] ETAPA 2: Relabel por clustering visual")
+                self._logger.info(f"\n[VCNC-Spatial] ETAPA 2: Relabel por clustering visual")
             
             # Recalcular GMM
             scores_by_class_updated = defaultdict(list)
@@ -791,7 +799,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
             criteria = self._get_current_criteria(epoch)
             
             if self.debug:
-                print(f"[VCNC-Spatial] Fase: {criteria['phase']}, Clusters: {len(set(cluster_ids))}")
+                self._logger.info(f"[VCNC-Spatial] Fase: {criteria['phase']}, Clusters: {len(set(cluster_ids))}")
             
             clusters = defaultdict(list)
             for box in all_box_data:
@@ -884,10 +892,10 @@ class VCNCKMeansConfusionAwareHook(Hook):
                         clustering_relabel_count += 1
             
             if self.debug:
-                print(f"[VCNC-Spatial] Relabelados por clustering: {clustering_relabel_count} "
+                self._logger.info(f"[VCNC-Spatial] Relabelados por clustering: {clustering_relabel_count} "
                       f"({clustering_relabel_count/len(all_box_data)*100:.2f}%)")
                 if gate_active:
-                    print(f"[VCNC-Spatial] Gate Etapa 2 — skip: {gate_skip_count['clustering']}, "
+                    self._logger.info(f"[VCNC-Spatial] Gate Etapa 2 — skip: {gate_skip_count['clustering']}, "
                           f"filter: {gate_filter_count['clustering']}")
         
         # ============================================================
@@ -898,7 +906,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
         
         if self.enable_spatial_refinement:
             if self.debug:
-                print(f"\n[VCNC-Spatial] ETAPA 3: Spatial Refinement (threshold={self.spatial_difficulty_threshold})")
+                self._logger.info(f"\n[VCNC-Spatial] ETAPA 3: Spatial Refinement (threshold={self.spatial_difficulty_threshold})")
             
             # Processar por imagem
             for img_path, img_boxes in boxes_by_image.items():
@@ -943,8 +951,8 @@ class VCNCKMeansConfusionAwareHook(Hook):
                             spatial_relabel_count += 1
             
             if self.debug:
-                print(f"[VCNC-Spatial] Boxes com alta contaminação: {spatial_stats['high_contamination']}")
-                print(f"[VCNC-Spatial] Relabelados por spatial: {spatial_relabel_count} "
+                self._logger.info(f"[VCNC-Spatial] Boxes com alta contaminação: {spatial_stats['high_contamination']}")
+                self._logger.info(f"[VCNC-Spatial] Relabelados por spatial: {spatial_relabel_count} "
                       f"({spatial_relabel_count/len(all_box_data)*100:.2f}%)")
         
         # ============================================================
@@ -954,7 +962,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
         
         if self.enable_gmm_filter:
             if self.debug:
-                print(f"\n[VCNC-Spatial] ETAPA 4: Filtragem GMM (threshold={self.filter_gmm_threshold})")
+                self._logger.info(f"\n[VCNC-Spatial] ETAPA 4: Filtragem GMM (threshold={self.filter_gmm_threshold})")
             
             # Recalcular GMM
             scores_by_class_final = defaultdict(list)
@@ -978,7 +986,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
                     filter_count += 1
             
             if self.debug:
-                print(f"[VCNC-Spatial] Filtrados (ignore_flag=1): {filter_count} "
+                self._logger.info(f"[VCNC-Spatial] Filtrados (ignore_flag=1): {filter_count} "
                       f"({filter_count/len(all_box_data)*100:.2f}%)")
         
         # ============================================================
@@ -988,17 +996,17 @@ class VCNCKMeansConfusionAwareHook(Hook):
             total_relabels = confidence_relabel_count + clustering_relabel_count + spatial_relabel_count
             total_gate_skip = gate_skip_count['confidence'] + gate_skip_count['clustering']
             total_gate_filter = gate_filter_count['confidence'] + gate_filter_count['clustering']
-            print(f"\n[VCNC-Spatial] ===== Resumo Época {epoch} =====")
-            print(f"[VCNC-Spatial] Total de boxes: {len(all_box_data)}")
-            print(f"[VCNC-Spatial] Relabel confiança: {confidence_relabel_count} ({confidence_relabel_count/len(all_box_data)*100:.2f}%)")
-            print(f"[VCNC-Spatial] Relabel clustering: {clustering_relabel_count} ({clustering_relabel_count/len(all_box_data)*100:.2f}%)")
-            print(f"[VCNC-Spatial] Relabel spatial: {spatial_relabel_count} ({spatial_relabel_count/len(all_box_data)*100:.2f}%)")
-            print(f"[VCNC-Spatial] Total relabels: {total_relabels} ({total_relabels/len(all_box_data)*100:.2f}%)")
-            print(f"[VCNC-Spatial] Gate (action='{self.confusion_gate_action}'): "
+            self._logger.info(f"\n[VCNC-Spatial] ===== Resumo Época {epoch} =====")
+            self._logger.info(f"[VCNC-Spatial] Total de boxes: {len(all_box_data)}")
+            self._logger.info(f"[VCNC-Spatial] Relabel confiança: {confidence_relabel_count} ({confidence_relabel_count/len(all_box_data)*100:.2f}%)")
+            self._logger.info(f"[VCNC-Spatial] Relabel clustering: {clustering_relabel_count} ({clustering_relabel_count/len(all_box_data)*100:.2f}%)")
+            self._logger.info(f"[VCNC-Spatial] Relabel spatial: {spatial_relabel_count} ({spatial_relabel_count/len(all_box_data)*100:.2f}%)")
+            self._logger.info(f"[VCNC-Spatial] Total relabels: {total_relabels} ({total_relabels/len(all_box_data)*100:.2f}%)")
+            self._logger.info(f"[VCNC-Spatial] Gate (action='{self.confusion_gate_action}'): "
                   f"skip={total_gate_skip} (conf={gate_skip_count['confidence']}, clu={gate_skip_count['clustering']}), "
                   f"filter={total_gate_filter} (conf={gate_filter_count['confidence']}, clu={gate_filter_count['clustering']})")
-            print(f"[VCNC-Spatial] Filtrados (etapa 4): {filter_count} ({filter_count/len(all_box_data)*100:.2f}%)")
-            print(f"[VCNC-Spatial] ==========================================\n")
+            self._logger.info(f"[VCNC-Spatial] Filtrados (etapa 4): {filter_count} ({filter_count/len(all_box_data)*100:.2f}%)")
+            self._logger.info(f"[VCNC-Spatial] ==========================================\n")
     
     def _reload_datasets(self, runner):
         """Recarrega os datasets."""
@@ -1011,7 +1019,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
                     subds.full_init()
         except Exception as e:
             if self.debug:
-                print(f"[VCNC-Spatial] Erro ao recarregar: {e}")
+                self._logger.info(f"[VCNC-Spatial] Erro ao recarregar: {e}")
     
     def _get_base_dataset(self, dataset):
         while hasattr(dataset, 'dataset'):
@@ -1032,7 +1040,7 @@ class VCNCKMeansConfusionAwareHook(Hook):
             instance['bbox_label'] = new_label
         except Exception as e:
             if self.debug:
-                print(f"[VCNC-Spatial] Erro relabel: {e}")
+                self._logger.info(f"[VCNC-Spatial] Erro relabel: {e}")
     
     def _apply_ignore_flag(self, datasets, sub_idx, data_idx, gt_idx):
         try:
@@ -1040,4 +1048,4 @@ class VCNCKMeansConfusionAwareHook(Hook):
             instance['ignore_flag'] = 1
         except Exception as e:
             if self.debug:
-                print(f"[VCNC-Spatial] Erro ignore_flag: {e}")
+                self._logger.info(f"[VCNC-Spatial] Erro ignore_flag: {e}")
