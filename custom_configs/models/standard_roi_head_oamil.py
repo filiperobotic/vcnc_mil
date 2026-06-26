@@ -225,6 +225,33 @@ class StandardRoIHeadOAMIL(StandardRoIHead):
         noisy_gt_boxes = bbox_head.bbox_coder.decode(
             pos_rois_xyxy, pos_bbox_targets)
 
+        # B'. Detect rows whose noisy_gt is degenerate (NaN or w/h<=0).
+        # These come from rcnn.add_gt_as_proposals=True picking up
+        # severely-noised GT boxes (e.g. loc60 with width=0 after noise),
+        # which produce NaN deltas in get_targets and then NaN here. We
+        # can't reconstruct a meaningful pseudo_gt for those bags — drop
+        # them from OA-IS and leave their bbox_targets unchanged, which
+        # matches what the baseline pipeline already does for those rows.
+        # bag_invalid is per-row; rows in the same bag share noisy_gt by
+        # construction, so each bag is uniformly valid or invalid.
+        bag_invalid = (
+            ~torch.isfinite(noisy_gt_boxes).all(dim=-1) |
+            (noisy_gt_boxes[:, 2] - noisy_gt_boxes[:, 0] <= 0) |
+            (noisy_gt_boxes[:, 3] - noisy_gt_boxes[:, 1] <= 0)
+        )
+        n_invalid = int(bag_invalid.sum().item())
+        if n_invalid > 0:
+            cur_epoch = bbox_head._epoch
+            if getattr(self, '_invalid_logged_epoch', -2) != cur_epoch:
+                MMLogger.get_current_instance().warning(
+                    f'[OA-MIL] {n_invalid}/{bag_invalid.numel()} pos rows '
+                    f'have degenerate noisy_gt (NaN or w/h<=0) at epoch '
+                    f'{cur_epoch}. Their bags are skipped by OA-IS; '
+                    f'bbox_targets for those rows pass through unchanged '
+                    f'(baseline behavior).'
+                )
+                self._invalid_logged_epoch = cur_epoch
+
         # C. Bag identification by noisy-GT coordinate sum
         _, bag_indices = torch.unique(
             noisy_gt_boxes.sum(dim=1), sorted=True, return_inverse=True)
@@ -233,6 +260,14 @@ class StandardRoIHeadOAMIL(StandardRoIHead):
             (bag_indices == b).nonzero(as_tuple=False).squeeze(1)
             for b in unique_bag_ids
         ]
+        # Drop bags whose noisy_gt is invalid. Checking any row of the
+        # bag (e.g. the first) is sufficient — all rows share noisy_gt.
+        bags = [b for b in bags if not bool(bag_invalid[b[0]].item())]
+        # Extreme case: every bag is invalid. Bail out the same way we
+        # do when there are no positives at all — bbox_head.loss falls
+        # back to baseline path.
+        if not bags:
+            return None, None
 
         # D. Iteration loop
         iter_num = (bbox_head.oaie_num + 1) if compute_oaie else 1
@@ -252,6 +287,17 @@ class StandardRoIHeadOAMIL(StandardRoIHead):
 
             new_pred_boxes = bbox_head.bbox_coder.decode(
                 decode_source, current_bbox_pred).clamp(min=0.0)
+            # Clamp predicted boxes to non-degenerate dims (x2 >= x1 + 1,
+            # y2 >= y1 + 1). In severe loc noise (e.g. loc60), early-iter
+            # predictions can have x2 ~ x1 or y2 ~ y1, which propagates
+            # through pseudo_gt into bbox_coder.encode as NaN. Baseline
+            # and VCNC-without-OAMIL don't hit this because they never
+            # use model predictions as regression targets.
+            min_size = 1.0  # pixels
+            new_pred_boxes[:, 2] = torch.maximum(
+                new_pred_boxes[:, 2], new_pred_boxes[:, 0] + min_size)
+            new_pred_boxes[:, 3] = torch.maximum(
+                new_pred_boxes[:, 3], new_pred_boxes[:, 1] + min_size)
             oaie_bboxes_list.append(new_pred_boxes)
 
             current_roi = pos_rois.clone()
@@ -279,7 +325,18 @@ class StandardRoIHeadOAMIL(StandardRoIHead):
             iter0_pred_boxes = oaie_bboxes_list[0]
             iter0_scores = oaie_scores_list[0]
 
-            pseudo_bbox_targets = torch.zeros_like(pos_bbox_targets)
+            # Pre-fill with original noisy deltas so rows belonging to
+            # invalid bags pass through to bbox_head.loss unchanged
+            # (baseline behavior). Valid bags below overwrite their rows.
+            pseudo_bbox_targets = pos_bbox_targets.clone()
+            # Per-row diagnostic bookkeeping. Cheap (P ~ 128) and only
+            # consulted when the isfinite assert below would trigger.
+            pseudo_gt_log = torch.zeros_like(pos_bbox_targets)
+            best_pred_box_log = torch.zeros_like(pos_bbox_targets)
+            best_score_log = torch.zeros(
+                pos_bbox_targets.size(0), device=pos_bbox_targets.device)
+            phi_log = torch.zeros_like(best_score_log)
+
             for in_bag in bags:
                 bag_scores = iter0_scores[in_bag]
                 bag_pred_boxes = iter0_pred_boxes[in_bag]
@@ -303,11 +360,48 @@ class StandardRoIHeadOAMIL(StandardRoIHead):
                 )
                 pseudo_bbox_targets[in_bag] = pseudo_targets
 
+                # Fan per-bag values into per-row logs for the diagnostic.
+                bag_n = in_bag.size(0)
+                pseudo_gt_log[in_bag] = pseudo_gt.repeat(bag_n, 1)
+                best_pred_box_log[in_bag] = best_pred_box.repeat(bag_n, 1)
+                best_score_log[in_bag] = best_score
+                phi_log[in_bag] = phi
+
+            # NaN/Inf in rows belonging to invalid bags is expected
+            # (they carry the pre-existing baseline-path NaN). Only
+            # flag rows we actually computed — i.e. valid bags.
+            bad_mask = (
+                ~torch.isfinite(pseudo_bbox_targets).all(dim=-1)
+                & ~bag_invalid
+            )
+            if bad_mask.any():
+                logger = MMLogger.get_current_instance()
+                bad_idx = bad_mask.nonzero(as_tuple=True)[0]
+                logger.error(
+                    f'[OA-MIL DIAG] pseudo_bbox_targets NaN/Inf in '
+                    f'{bad_idx.numel()} VALID rows (invalid bags ignored)')
+                for i in bad_idx[:5].tolist():
+                    logger.error(f'  row {i}:')
+                    logger.error(
+                        f'    roi xyxy:              {pos_rois_xyxy[i].tolist()}')
+                    logger.error(
+                        f'    noisy_gt (decoded):    {noisy_gt_boxes[i].tolist()}')
+                    logger.error(
+                        f'    best_pred_box (bag):   {best_pred_box_log[i].tolist()}')
+                    logger.error(
+                        f'    best_score:            {best_score_log[i].item():.6f}')
+                    logger.error(
+                        f'    phi:                   {phi_log[i].item():.6f}')
+                    logger.error(
+                        f'    pseudo_gt (unclamped): {pseudo_gt_log[i].tolist()}')
+                    logger.error(
+                        f'    pseudo_bbox_targets:   {pseudo_bbox_targets[i].tolist()}')
+
             assert pseudo_bbox_targets.shape == pos_bbox_targets.shape
-            assert torch.isfinite(pseudo_bbox_targets).all(), (
-                'pseudo_bbox_targets contains NaN/Inf — check oais_gamma, '
-                'oais_theta and bbox_coder behavior on degenerate predicted '
-                'boxes.')
+            assert not bad_mask.any(), (
+                'pseudo_bbox_targets contains NaN/Inf in VALID rows — '
+                'check oais_gamma, oais_theta and bbox_coder behavior on '
+                'degenerate predicted boxes.')
 
         oais_info = dict(
             scores_list=oaie_scores_list,
