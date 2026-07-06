@@ -14,4 +14,27 @@ class SetEpochInfoHook(Hook):
         model = runner.model
         if is_model_wrapper(model):
             model = model.module
-        model.set_epoch(epoch)
+
+        # model.set_epoch(epoch). # original
+
+        #added by Filipe
+        if hasattr(model, 'set_epoch'):
+
+            model.set_epoch(epoch)
+
+        if hasattr(model, 'roi_head'):
+
+            model.roi_head.current_epoch = epoch
+
+            if hasattr(model.roi_head, 'set_epoch'):
+
+                model.roi_head.set_epoch(epoch)
+
+            if hasattr(model.roi_head, 'bbox_head'):
+
+                model.roi_head.bbox_head.current_epoch = epoch
+
+                if hasattr(model.roi_head.bbox_head, 'set_epoch'):
+
+                    model.roi_head.bbox_head.set_epoch(epoch)
+        #end addition

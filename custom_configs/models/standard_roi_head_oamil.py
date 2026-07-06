@@ -294,10 +294,19 @@ class StandardRoIHeadOAMIL(StandardRoIHead):
             # and VCNC-without-OAMIL don't hit this because they never
             # use model predictions as regression targets.
             min_size = 1.0  # pixels
-            new_pred_boxes[:, 2] = torch.maximum(
-                new_pred_boxes[:, 2], new_pred_boxes[:, 0] + min_size)
-            new_pred_boxes[:, 3] = torch.maximum(
-                new_pred_boxes[:, 3], new_pred_boxes[:, 1] + min_size)
+            # Use torch.stack to build a fresh tensor instead of inplace
+            # column assignment: new_pred_boxes is an autograd leaf of the
+            # decode/clamp op, and inplace writes bump its version counter,
+            # breaking bbox_pred's backward ("a variable needed for gradient
+            # computation has been modified by an inplace operation").
+            new_pred_boxes = torch.stack([
+                new_pred_boxes[:, 0],
+                new_pred_boxes[:, 1],
+                torch.maximum(new_pred_boxes[:, 2],
+                              new_pred_boxes[:, 0] + min_size),
+                torch.maximum(new_pred_boxes[:, 3],
+                              new_pred_boxes[:, 1] + min_size),
+            ], dim=-1)
             oaie_bboxes_list.append(new_pred_boxes)
 
             current_roi = pos_rois.clone()
