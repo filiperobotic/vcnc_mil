@@ -811,7 +811,32 @@ class VCNCKMeansConfusionAwareHook(Hook):
             c_suspect_gmm = criteria['suspect_gmm_threshold']
             c_similarity = criteria['similarity_threshold']
             c_consensus = criteria['cluster_consensus']
-            
+
+            # DIAGNÓSTICO (não altera E2): concordância entre a classe
+            # majoritária do cluster e a classe original da anotação (dataset_label).
+            # Mede se o sinal de clustering distingue "ruído de classe" de "sem ruído".
+            if self.enable_confidence_relabel:
+                self._logger.warning(
+                    "[VCNC-Spatial] Concordância dataset↔cluster está "
+                    "sendo medida com E1 ativo. box['gt_label'] pode "
+                    "conter rótulos já modificados pela E1."
+                )
+            diag_total_agree = 0
+            diag_total_samples = 0
+            for cluster_id, cluster_boxes in clusters.items():
+                cluster_dataset_labels = [b['gt_label'] for b in cluster_boxes]
+                majoritary_class = Counter(cluster_dataset_labels).most_common(1)[0][0]
+                n_agree = sum(1 for lbl in cluster_dataset_labels if lbl == majoritary_class)
+                n_disagree = len(cluster_dataset_labels) - n_agree
+                diag_total_agree += n_agree
+                diag_total_samples += n_agree + n_disagree
+            if diag_total_samples > 0:
+                concordancia_percentual = diag_total_agree / diag_total_samples * 100
+                self._logger.info(
+                    f"[VCNC-Spatial] Concordância dataset↔cluster: "
+                    f"{diag_total_agree}/{diag_total_samples} ({concordancia_percentual:.2f}%)"
+                )
+
             for cluster_id, cluster_boxes in clusters.items():
                 if len(cluster_boxes) < 2:
                     continue

@@ -14,15 +14,13 @@ from .base_roi_head import BaseRoIHead
 
 
 @MODELS.register_module()
-class StandardRoIHeadOAMILDANIEL(BaseRoIHead):
+class StandardRoIHeadKLDANIEL(BaseRoIHead):
     """Simplest base roi head including one bbox head and one mask head."""
 
     def init_assigner_sampler(self) -> None:
         """Initialize assigner and sampler."""
         self.bbox_assigner = None
         self.bbox_sampler = None
-        # mmdetection/mmdet/engine/hooks/set_epoch_info_hook.py
-        #self.bbox_head.current_epoch  = 0 
         if self.train_cfg:
             self.bbox_assigner = TASK_UTILS.build(self.train_cfg.assigner)
             self.bbox_sampler = TASK_UTILS.build(
@@ -134,17 +132,8 @@ class StandardRoIHeadOAMILDANIEL(BaseRoIHead):
         losses = dict()
         # bbox head loss
         if self.with_bbox:
-            bbox_results, rois, bbox_targets = self.bbox_loss(x, sampling_results)
-            #losses.update(bbox_results['loss_bbox'])
-
-            # apply OA-MIL
-            loss_oamil, pseudo_bbox_targets = self._oamil(bbox_targets, bbox_results, rois, x)
-
-            # compute classification and localization loss
-            loss_bbox = self.bbox_head.loss(bbox_results['cls_score'], bbox_results['bbox_pred'], rois, *bbox_targets, pseudo_bbox_targets=pseudo_bbox_targets)
-
-            losses.update(loss_bbox)
-            losses.update(loss_oamil)
+            bbox_results = self.bbox_loss(x, sampling_results)
+            losses.update(bbox_results['loss_bbox'])
 
         # mask head forward and loss
         if self.with_mask:
@@ -175,13 +164,14 @@ class StandardRoIHeadOAMILDANIEL(BaseRoIHead):
             x[:self.bbox_roi_extractor.num_inputs], rois)
         if self.with_shared_head:
             bbox_feats = self.shared_head(bbox_feats)
-        cls_score, bbox_pred = self.bbox_head(bbox_feats)
+        cls_score, bbox_pred, bbox_var = self.bbox_head(bbox_feats)
 
         bbox_results = dict(
-            cls_score=cls_score, bbox_pred=bbox_pred, bbox_feats=bbox_feats)
+            cls_score=cls_score, bbox_pred=bbox_pred, bbox_var=bbox_var, bbox_feats=bbox_feats)
         return bbox_results
 
-    def bbox_loss(self, x: Tuple[Tensor], sampling_results: List[SamplingResult]) -> dict:
+    def bbox_loss(self, x: Tuple[Tensor],
+                  sampling_results: List[SamplingResult]) -> dict:
         """Perform forward propagation and loss calculation of the bbox head on
         the features of the upstream network.
 
@@ -203,194 +193,13 @@ class StandardRoIHeadOAMILDANIEL(BaseRoIHead):
         bbox_loss_and_target = self.bbox_head.loss_and_target(
             cls_score=bbox_results['cls_score'],
             bbox_pred=bbox_results['bbox_pred'],
+            bbox_var=bbox_results['bbox_var'],
             rois=rois,
             sampling_results=sampling_results,
             rcnn_train_cfg=self.train_cfg)
 
         bbox_results.update(loss_bbox=bbox_loss_and_target['loss_bbox'])
-        bbox_targets = self.bbox_head.get_targets(sampling_results, self.train_cfg)
-
-        return bbox_results, rois, bbox_targets
-
-    def _oamil(self, bbox_targets, bbox_results, rois, x):
-        """
-        Procedure:
-            1. perform instance selection
-            2. compute instance selection loss
-        """
-        loss_bbox = dict()
-
-        # lambda controls whether to perform OA-MIL
-        if self.bbox_head.oamil_lambda > 0:
-            '''
-            1. Perform instance selection
-            '''
-            # get bbox targets
-            labels, cur_bbox_targets = bbox_targets[0], bbox_targets[2]
-            pos_inds = (labels >= 0) & (labels < self.bbox_head.num_classes)
-            pos_labels = labels[pos_inds.type(torch.bool)]
-
-            # get indices of unique gt boxes
-            pos_bbox_targets = cur_bbox_targets[pos_inds.type(torch.bool)]
-            noisy_gt_boxes = self.bbox_head.bbox_coder.decode(rois[:, 1:][pos_inds.type(torch.bool)], pos_bbox_targets)
-            uniq_inst, pos_indices = torch.unique(noisy_gt_boxes.sum(dim=1), sorted=True, return_inverse=True)
-            
-            # perform Object-Aware Instance Selection (OA-IS)
-            oaie_scores_list, pseudo_bbox_targets = self._instance_selection(bbox_results, labels, rois, x, cur_bbox_targets)
-
-            '''
-            2. Compute instance selection loss
-            '''
-            inst_scores_list = []
-            for confidence_scores in oaie_scores_list:
-                inst_scores = self._get_instance_cls_scores(pos_labels, confidence_scores, uniq_inst, pos_indices)
-                inst_scores_list.append(inst_scores)
-            
-            if len(inst_scores_list) > 1:
-                if self.bbox_head.oaie_type == 'refine':
-                    loss_bbox['loss_oais'] = (1-inst_scores_list[0]) + (1-sum(inst_scores_list[1:])/self.bbox_head.oaie_num)*self.bbox_head.oaie_coef
-                elif self.bbox_head.oaie_type == 'random':
-                    loss_bbox['loss_oais'] = 1 - sum(inst_scores_list)/(self.bbox_head.oaie_num+1)
-            elif len(inst_scores_list) == 1:
-                loss_bbox['loss_oais'] = 1-inst_scores_list[0]
-            else:
-                loss_bbox['loss_oais'] = torch.tensor([1.0], device="cuda")
-            loss_bbox['loss_oais'] *= self.bbox_head.oamil_lambda
-        else:
-            pseudo_bbox_targets = None
-
-        return loss_bbox, pseudo_bbox_targets
-
-    def _instance_selection(self, bbox_results, labels, rois, x, cur_bbox_targets):
-        """
-        Procedure of instance selection:
-            1. construct object bags 
-            2. apply instance selector (OA-IE is optional in step 2)
-            3. get best selected instances using Eq. (4)
-        """
-
-        '''
-        1. Construct object bags
-        '''
-        # get indices of object bags from noisy gt
-        pos_inds = (labels >= 0) & (labels < self.bbox_head.num_classes)
-        inds = torch.ones(pos_inds.sum()).cuda()
-        pos_bbox_targets = cur_bbox_targets[pos_inds.type(torch.bool)]
-        noisy_gt_boxes = self.bbox_head.bbox_coder.decode(rois[:, 1:][pos_inds.type(torch.bool)], pos_bbox_targets)
-        uniq_inst, pos_indices = torch.unique(noisy_gt_boxes.sum(dim=1), sorted=True, return_inverse=True)
-        object_bag_indices = [torch.where(pos_indices == inst)[0] for inst in torch.unique(pos_indices)]
-
-        # initialize bbox results for object bags
-        new_bbox_results = {}
-        new_bbox_results['cls_score'], new_bbox_results['bbox_pred'] = bbox_results['cls_score'], bbox_results['bbox_pred']
-        
-        # keep positive instances
-        new_bbox_results['bbox_pred'] = new_bbox_results['bbox_pred'].view(new_bbox_results['bbox_pred'].size(0), -1, 4)[pos_inds.type(torch.bool)]
-        
-        '''
-        2. Apply instance selector
-            - OA-IE is optional in this step
-        '''
-        # The number of iteration depends on whether to perform Object-Aware Instance Extension (OA-IE)
-        #   - iter num=1 if w/o OA-IE 
-        #   - iter num=N+1 if with OA-IE, where N is the number of OA-IE
-        oaie_bboxes_list, oaie_scores_list = [], []
-        iter_num = self.bbox_head.oaie_num+1 if self.bbox_head.oaie_flag and self.bbox_head.current_epoch +1 >= self.bbox_head.oaie_epoch else 1
-        for i in range(iter_num):
-            # get prediction of each instance
-            bbox_pred = new_bbox_results['bbox_pred']
-            # print(bbox_pred.size())
-            #empty_tensor = False
-            if bbox_pred.nelement() == 0:
-                continue
-            #    empty_tensor = True
-            #    bbox_pred = torch.zeros(1, 20, 4, device="cuda")
-            inds = torch.ones(bbox_pred.size(0)).type(torch.bool).cuda()
-            pos_bbox_pred = bbox_pred.view(bbox_pred.size(0), -1, 4)[inds, labels[pos_inds.type(torch.bool)]]
-
-            # decode prediction of each instance
-            if i == 0 or self.bbox_head.oaie_type == 'random':
-                new_pred_boxes = self.bbox_head.bbox_coder.decode(rois[:, 1:][pos_inds.type(torch.bool)], pos_bbox_pred)
-            else:
-                new_pred_boxes = self.bbox_head.bbox_coder.decode(new_roi[:, 1:], pos_bbox_pred)
-
-            new_roi = rois[pos_inds.type(torch.bool)].clone()
-            new_roi[:,1:] = new_pred_boxes
-            oaie_bboxes_list.append(new_pred_boxes)
-
-            #if empty_tensor:
-            #    confidence_scores = torch.zeros(1, device="cuda")
-            #    oaie_scores_list.append(confidence_scores)
-            #    continue
-
-            # apply instance selector and output confidence scores
-            # NOTE: instance selector shares the same parameters with classifier
-            new_bbox_results = self._bbox_forward(x, new_roi)
-            confidence_scores = torch.softmax(new_bbox_results['cls_score'], dim=1)[inds.type(torch.bool), labels[pos_inds.type(torch.bool)]]
-            oaie_scores_list.append(confidence_scores)
-
-            #print(new_pred_boxes)
-            #print(confidence_scores.size())
-            #print(confidence_scores, "\n\n\n")
-
-        '''
-        3. Get best selected instances
-        '''
-        # perform OA-IS
-        oais_flag = self.bbox_head.oais_flag and (self.bbox_head.current_epoch +1 >= self.bbox_head.oais_epoch)
-        if oais_flag and len(oaie_bboxes_list) > 0 and len(oaie_scores_list) > 0:
-            # to save best selected instances
-            pseudo_bbox_targets = torch.zeros_like(cur_bbox_targets[pos_inds.type(torch.bool)]).cuda()
-            pseudo_gt_boxes = torch.zeros_like(cur_bbox_targets[pos_inds.type(torch.bool)]).cuda()
-
-            new_pred_boxes, confidence_scores = oaie_bboxes_list[0], oaie_scores_list[0]
-            # iterate over each object bag
-            for index in object_bag_indices:
-                # get confidence score of each instance in an object bag
-                object_bag_boxes = new_pred_boxes[index]
-                object_bag_scores = confidence_scores[index]
-
-                # get best instance in each object bag
-                _, max_inds = torch.max(object_bag_scores, dim=0)
-                best_score = object_bag_scores[max_inds].clone()
-                best_instance = object_bag_boxes[max_inds].clone()
-                best_instance = best_instance.clamp(min=0.0).view(1, -1)
-
-                # modify noisy gt using Eq. (4)
-                phi = ((best_score.detach())**self.bbox_head.oais_gamma).clamp(max=self.bbox_head.oais_theta)
-                best_selected_instance = best_instance.detach() * phi + noisy_gt_boxes[index[0]].view(1, -1) * (1 - phi)
-
-                # reset grount-truth according to best selected instance
-                pseudo_gt_targets = self.bbox_head.bbox_coder.encode(rois[:, 1:][pos_inds.type(torch.bool)][index], best_selected_instance.repeat(len(index), 1))
-                pseudo_bbox_targets[index] = pseudo_gt_targets
-                pseudo_gt_boxes[index] = best_selected_instance.repeat(len(index), 1)
-        else:
-            pseudo_bbox_targets = None
-
-        return oaie_scores_list, pseudo_bbox_targets
-
-    def _get_instance_cls_scores(self, pos_labels, confidence_scores, uniq_inst, pos_indices):
-        """Compute confidence scores of object bags in training."""
-        # instance-level confidence scores
-        inst_labels = []
-        inst_scores = []
-        for inst in torch.unique(pos_indices):
-            inst_inds = torch.where(pos_indices == inst)[0]
-            inst_scores.append(confidence_scores[inst_inds].max().view(-1))
-            inst_labels.append(pos_labels[inst_inds[0]].view(-1))
-
-        inst_labels = torch.cat(inst_labels, dim=0)
-        inst_scores = torch.cat(inst_scores, dim=0)
-
-        # class-level confidence scores
-        cls_scores = 0
-        for cls in torch.unique(inst_labels):
-            cls_inds = torch.where(inst_labels == cls)[0]
-            cls_scores += inst_scores[cls_inds].mean()
-        cls_scores /= len(torch.unique(inst_labels))
-        return cls_scores
-
-
+        return bbox_results
 
     def mask_loss(self, x: Tuple[Tensor],
                   sampling_results: List[SamplingResult], bbox_feats: Tensor,
@@ -529,6 +338,12 @@ class StandardRoIHeadOAMILDANIEL(BaseRoIHead):
         # split batch bbox prediction back to each image
         cls_scores = bbox_results['cls_score']
         bbox_preds = bbox_results['bbox_pred']
+
+        if self.bbox_head.var_vote:
+            bbox_var = bbox_results['bbox_var']
+        else:
+            bbox_var = None
+
         num_proposals_per_img = tuple(len(p) for p in proposals)
         rois = rois.split(num_proposals_per_img, 0)
         cls_scores = cls_scores.split(num_proposals_per_img, 0)
@@ -551,7 +366,8 @@ class StandardRoIHeadOAMILDANIEL(BaseRoIHead):
             bbox_preds=bbox_preds,
             batch_img_metas=batch_img_metas,
             rcnn_test_cfg=rcnn_test_cfg,
-            rescale=rescale)
+            rescale=rescale,
+            variance=bbox_var)
         return result_list
 
     #FILIPE CODE

@@ -24,6 +24,7 @@ from .sparse_roi_head import SparseRoIHead
 from .standard_roi_head import StandardRoIHead
 from .trident_roi_head import TridentRoIHead
 
+from .standard_roi_head_kl_daniel import StandardRoIHeadKLDANIEL
 from .standard_roi_head_oamil_daniel import StandardRoIHeadOAMILDANIEL
 
 __all__ = [
@@ -36,5 +37,5 @@ __all__ = [
     'SingleRoIExtractor', 'PISARoIHead', 'PointRendRoIHead', 'MaskPointHead',
     'CoarseMaskHead', 'DynamicRoIHead', 'SparseRoIHead', 'TridentRoIHead',
     'SCNetRoIHead', 'SCNetMaskHead', 'SCNetSemanticHead', 'SCNetBBoxHead',
-    'FeatureRelayHead', 'GlobalContextHead', 'MultiInstanceRoIHead', 'StandardRoIHeadOAMILDANIEL'
+    'FeatureRelayHead', 'GlobalContextHead', 'MultiInstanceRoIHead', 'StandardRoIHeadOAMILDANIEL', 'StandardRoIHeadKLDANIEL'
 ]
