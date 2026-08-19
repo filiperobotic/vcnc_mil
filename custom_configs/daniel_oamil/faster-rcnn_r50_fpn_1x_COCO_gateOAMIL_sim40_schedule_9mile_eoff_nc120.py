@@ -71,7 +71,7 @@ custom_hooks = [
     ),
 ]
 
-
+train_dataloader = dict(batch_size=8, num_workers=4)
 
 # training schedule, voc dataset is repeated 3 times, in
 # `_base_/datasets/voc0712.py`, so the actual epoch = 4 * 3 = 12

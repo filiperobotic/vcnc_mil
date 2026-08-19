@@ -46,6 +46,7 @@ train_dataloader = dict(
         ann_file='annotations/instances_train2017.json',
         data_prefix=dict(img='train2017/'),
         filter_cfg=dict(filter_empty_gt=True, min_size=32),
+        serialize_data=False,  # Define como False (Filipe) — VCNC hook precisa de data_list vivo
         pipeline=train_pipeline,
         backend_args=backend_args))
 val_dataloader = dict(

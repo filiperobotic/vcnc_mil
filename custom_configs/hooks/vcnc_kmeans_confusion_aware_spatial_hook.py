@@ -582,6 +582,10 @@ class VCNCKMeansConfusionAwareHook(Hook):
         # datasets = dataset.datasets
         datasets = unwrap_to_leaf_datasets(dataset)
         dataset_img_map = self._build_image_map(datasets)
+
+        # Mapa gt_instances (filtrado) -> instances (completo), válido só nesta
+        # época: o reload acima restaura os ignore_flag originais do arquivo.
+        self._valid_idx_cache = {}
         
         assigner = MaxIoUAssigner(
             pos_iou_thr=self.iou_assigner,
@@ -740,7 +744,8 @@ class VCNCKMeansConfusionAwareHook(Hook):
                                 datasets,
                                 box['sub_idx'],
                                 box['data_idx'],
-                                box['gt_idx']
+                                box['gt_idx'],
+                                img_path=box['img_path']
                             )
                             box['filtered'] = True
                             gate_filter_count['confidence'] += 1
@@ -755,9 +760,10 @@ class VCNCKMeansConfusionAwareHook(Hook):
                         box['sub_idx'],
                         box['data_idx'],
                         box['gt_idx'],
-                        new_label
+                        new_label,
+                        img_path=box['img_path']
                     )
-                    
+
                     box['gt_label'] = new_label
                     box['score_gt'] = box['scores'][new_label].item()
                     box['relabeled_by'] = 'confidence'
@@ -895,7 +901,8 @@ class VCNCKMeansConfusionAwareHook(Hook):
                                     datasets,
                                     box['sub_idx'],
                                     box['data_idx'],
-                                    box['gt_idx']
+                                    box['gt_idx'],
+                                    img_path=box['img_path']
                                 )
                                 box['filtered'] = True
                                 gate_filter_count['clustering'] += 1
@@ -908,7 +915,8 @@ class VCNCKMeansConfusionAwareHook(Hook):
                             box['sub_idx'],
                             box['data_idx'],
                             box['gt_idx'],
-                            dominant_label
+                            dominant_label,
+                            img_path=box['img_path']
                         )
                         
                         box['gt_label'] = dominant_label
@@ -967,9 +975,10 @@ class VCNCKMeansConfusionAwareHook(Hook):
                                 box['sub_idx'],
                                 box['data_idx'],
                                 box['gt_idx'],
-                                new_label
+                                new_label,
+                                img_path=box['img_path']
                             )
-                            
+
                             box['gt_label'] = new_label
                             box['score_gt'] = box['scores'][new_label].item()
                             box['relabeled_by'] = 'spatial'
@@ -1005,7 +1014,8 @@ class VCNCKMeansConfusionAwareHook(Hook):
                         datasets,
                         box['sub_idx'],
                         box['data_idx'],
-                        box['gt_idx']
+                        box['gt_idx'],
+                        img_path=box['img_path']
                     )
                     box['filtered'] = True
                     filter_count += 1
@@ -1059,18 +1069,63 @@ class VCNCKMeansConfusionAwareHook(Hook):
                     img_map[data_info['img_path']] = (sub_idx, data_idx)
         return img_map
     
-    def _apply_relabel(self, datasets, sub_idx, data_idx, gt_idx, new_label):
+    def _resolve_orig_instance_idx(self, instances, gt_idx, img_path=None,
+                                   cache_key=None):
+        """
+        Converte um índice de `gt_instances` (lista FILTRADA pelo PackDetInputs,
+        que remove instâncias com ignore_flag == 1) para o índice correspondente
+        na lista completa `data_list[...]['instances']`.
+
+        O mapa é memoizado por (sub_idx, data_idx) e o cache é zerado a cada
+        época em `before_train_epoch`. Isso é necessário porque
+        `_apply_ignore_flag` escreve `ignore_flag = 1` na MESMA lista: sem o
+        cache, uma filtragem da Etapa 1/2 encolheria `valid_orig_idx` e os
+        `gt_idx` resolvidos depois (Etapas 2/3/4) apontariam para a instância
+        errada. O cache congela o mapeamento no estado em que os `gt_idx` foram
+        de fato produzidos (a coleta, logo após o reload do dataset).
+
+        Retorna None se o gt_idx estiver fora do intervalo válido.
+        """
+        if cache_key is not None and cache_key in self._valid_idx_cache:
+            valid_orig_idx = self._valid_idx_cache[cache_key]
+        else:
+            valid_orig_idx = [i for i, inst in enumerate(instances)
+                              if inst.get('ignore_flag', 0) == 0]
+            if cache_key is not None:
+                self._valid_idx_cache[cache_key] = valid_orig_idx
+
+        if gt_idx >= len(valid_orig_idx):
+            self._logger.warning(
+                f"[VCNC-Spatial] gt_idx {gt_idx} fora do intervalo "
+                f"({len(valid_orig_idx)} instâncias válidas de {len(instances)}) "
+                f"em {img_path} — pulando."
+            )
+            return None
+
+        return valid_orig_idx[gt_idx]
+
+    def _apply_relabel(self, datasets, sub_idx, data_idx, gt_idx, new_label,
+                       img_path=None):
         try:
-            instance = datasets[sub_idx].data_list[data_idx]['instances'][gt_idx]
-            instance['bbox_label'] = new_label
+            instances = datasets[sub_idx].data_list[data_idx]['instances']
+            orig_idx = self._resolve_orig_instance_idx(
+                instances, gt_idx, img_path, cache_key=(sub_idx, data_idx))
+            if orig_idx is None:
+                return
+            instances[orig_idx]['bbox_label'] = new_label
         except Exception as e:
             if self.debug:
                 self._logger.info(f"[VCNC-Spatial] Erro relabel: {e}")
-    
-    def _apply_ignore_flag(self, datasets, sub_idx, data_idx, gt_idx):
+
+    def _apply_ignore_flag(self, datasets, sub_idx, data_idx, gt_idx,
+                           img_path=None):
         try:
-            instance = datasets[sub_idx].data_list[data_idx]['instances'][gt_idx]
-            instance['ignore_flag'] = 1
+            instances = datasets[sub_idx].data_list[data_idx]['instances']
+            orig_idx = self._resolve_orig_instance_idx(
+                instances, gt_idx, img_path, cache_key=(sub_idx, data_idx))
+            if orig_idx is None:
+                return
+            instances[orig_idx]['ignore_flag'] = 1
         except Exception as e:
             if self.debug:
                 self._logger.info(f"[VCNC-Spatial] Erro ignore_flag: {e}")

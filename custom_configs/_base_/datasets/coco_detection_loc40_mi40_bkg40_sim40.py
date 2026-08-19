@@ -47,6 +47,7 @@ train_dataloader = dict(
         ann_file='NoiseAnnotations/instances_train2017_location_40_missing_40_bkgd_40_class_noise_40_simetric.json',
         data_prefix=dict(img='train2017/'),
         filter_cfg=dict(filter_empty_gt=True, min_size=32),
+        serialize_data=False,  # Define como False (Filipe) — VCNC hook precisa de data_list vivo
         pipeline=train_pipeline,
         backend_args=backend_args))
 val_dataloader = dict(
