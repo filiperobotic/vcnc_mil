@@ -281,6 +281,17 @@ class VCNCKMeansConfusionAwareHook(Hook):
                  confusion_gate_min_samples: int = 50,
                  confusion_gate_mad_factor: float = 3.0,
                  confusion_gate_ratio_factor: float = 10.0,
+                 # === GATE v2 (NEW) — defaults reproduzem o comportamento antigo ===
+                 # 'mean': sev = (C_ij + C_ji)/2   (comportamento original)
+                 # 'min' : sev = min(C_ij, C_ji)   (exige reciprocidade — elimina
+                 #         pares person<->X gerados por ruído simétrico + desbalanceamento)
+                 confusion_gate_severity: str = 'mean',
+                 # Piso absoluto do threshold. 0.0 = sem piso (original).
+                 # Evita threshold ~0 quando a distribuição de severidade é zero-inflada
+                 # (80 classes -> ~3000 pares, quase todos com confusão 0).
+                 confusion_gate_min_threshold: float = 0.0,
+                 # Se True, mediana/MAD são calculados só sobre pares com sev > 0.
+                 confusion_gate_ignore_zero_pairs: bool = False,
                  confusion_gate_action: str = 'filter',   # 'filter' ou 'skip'
                  # IMPORTANTE: True por default — gate só ativo APÓS progressive_epochs.
                  # Necessário para K-means porque a matriz de confusão na época 2 é
@@ -341,6 +352,11 @@ class VCNCKMeansConfusionAwareHook(Hook):
         self.confusion_gate_min_samples = confusion_gate_min_samples
         self.confusion_gate_mad_factor = confusion_gate_mad_factor
         self.confusion_gate_ratio_factor = confusion_gate_ratio_factor
+        self.confusion_gate_severity = confusion_gate_severity
+        assert self.confusion_gate_severity in ('mean', 'min'), \
+            f"confusion_gate_severity deve ser 'mean' ou 'min', recebeu {confusion_gate_severity!r}"
+        self.confusion_gate_min_threshold = confusion_gate_min_threshold
+        self.confusion_gate_ignore_zero_pairs = confusion_gate_ignore_zero_pairs
         self.confusion_gate_action = confusion_gate_action
         assert self.confusion_gate_action in ('filter', 'skip'), \
             f"confusion_gate_action deve ser 'filter' ou 'skip', recebeu {confusion_gate_action!r}"
@@ -499,22 +515,31 @@ class VCNCKMeansConfusionAwareHook(Hook):
             for j in range(i + 1, K):
                 if not (valid_classes[i] and valid_classes[j]):
                     continue
-                severity = 0.5 * (C[i, j] + C[j, i])
+                if self.confusion_gate_severity == 'min':
+                    severity = min(C[i, j], C[j, i])
+                else:
+                    severity = 0.5 * (C[i, j] + C[j, i])
                 sev_pairs.append((i, j, severity))
 
         if len(sev_pairs) == 0:
             return set(), {
                 'median': 0.0, 'mad': 0.0, 'threshold': 0.0,
-                'n_valid_pairs': 0, 'n_confused_pairs': 0, 'top_pairs': []
+                'n_valid_pairs': 0, 'n_confused_pairs': 0, 'top_pairs': [],
+                'n_nonzero_pairs': 0,
+                'severity_mode': self.confusion_gate_severity,
+                'min_threshold': self.confusion_gate_min_threshold,
             }
 
         severities = np.array([s for _, _, s in sev_pairs], dtype=np.float64)
-        median_sev = float(np.median(severities))
-        mad_sev = float(np.median(np.abs(severities - median_sev)))
+        ref = severities[severities > 0] if self.confusion_gate_ignore_zero_pairs else severities
+        if ref.size == 0:
+            ref = severities  # todos zero: cai no piso absoluto abaixo
+        median_sev = float(np.median(ref))
+        mad_sev = float(np.median(np.abs(ref - median_sev)))
 
         thr_mad = median_sev + self.confusion_gate_mad_factor * mad_sev
         thr_ratio = self.confusion_gate_ratio_factor * median_sev
-        threshold = max(thr_mad, thr_ratio)
+        threshold = max(thr_mad, thr_ratio, self.confusion_gate_min_threshold)
 
         confused_pairs = set()
         for i, j, sev in sev_pairs:
@@ -542,6 +567,9 @@ class VCNCKMeansConfusionAwareHook(Hook):
             'n_valid_pairs': len(sev_pairs),
             'n_confused_pairs': len(confused_pairs) // 2,
             'top_pairs': top_pairs,
+            'n_nonzero_pairs': int((severities > 0).sum()),
+            'severity_mode': self.confusion_gate_severity,
+            'min_threshold': self.confusion_gate_min_threshold,
         }
         return confused_pairs, stats
 
@@ -711,6 +739,9 @@ class VCNCKMeansConfusionAwareHook(Hook):
                 self._logger.info(f"[VCNC-Spatial] Threshold = max(med+{self.confusion_gate_mad_factor}*MAD, "
                       f"{self.confusion_gate_ratio_factor}*med) = "
                       f"{confusion_stats['threshold']:.4f}")
+                self._logger.info(f"[VCNC-Spatial] Severidade modo={confusion_stats['severity_mode']}, "
+                      f"pares com sev>0: {confusion_stats['n_nonzero_pairs']}, "
+                      f"piso={confusion_stats['min_threshold']:.3f}")
                 self._logger.info(f"[VCNC-Spatial] Top 10 pares por severidade:")
                 for tp in confusion_stats['top_pairs']:
                     flag = "  ★ RUIDOSO" if tp['is_confused'] else ""
